@@ -50,7 +50,7 @@ Flower show weight: 10×(rarity+1) + min(streak, 50) × hunger factor. Hunger ef
 | draw ticket | 0.0005 | 0.00005 | 0.00045 | |
 | spin | 0.001 | 0.0001 | 0.0009 | the pot is EV-neutral on spins (90% in, 90% RTP out) |
 | flower show entry | 0.001 | 0.0001 | 0 | 0.0009 goes to that week's show prize |
-| market sale | price | 4% | 1% | seller gets 95% |
+| market sale | price | 3% (treasury) | 2% (Flower Show pot) | seller gets 95% |
 
 Guarantees, each one tested:
 
