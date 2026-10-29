@@ -20,6 +20,9 @@ Write actions (print {to,inputData,value} + baw preview command; never sign anyt
   Randomness (SeedsRandom; rng address = SEEDS_RNG or game.coordinator()):
   commit SECRET_TEXT   (game.commitNext(keccak256(SECRET_TEXT)) - your commitment for your next random job)
   rng-fallback REQ_ID  (anyone, once the operator is 200 blocks late) | rng-settle REQ_ID (re-targeted request)
+  settle-pending WALLET [ID[,ID..]] [--req REQ_ID[,..]] [--blocks N]   (read-only: finds your pending bloom/pack/spin
+      randomness and prints the ready rng-fallback / rng-settle tx once the operator is 200 blocks late;
+      next-action WALLET ID embeds the same tx as `fallback` on WAIT_REVEAL; SEEDS_AUTO_FALLBACK=0 turns that off)
   Tamagotchi care (SeedsCare; owner OR its caretaker agent, one flower per call):
   feed ID | care-water ID | tend ID   (owner sends the water fee; a caretaker's fee comes from the care budget)
   Caretaker spending from the owner's care budget (caretaker agent only):
@@ -179,8 +182,10 @@ def decode(types, data):
 # ───────────────────────── config / rpc ─────────────────────────
 CFG = {"rpc": os.environ.get("SEEDS_RPC", "https://bsc-dataseed.bnbchain.org"),
        "chain": int(os.environ.get("SEEDS_CHAIN_ID", "56")), "from": os.environ.get("SEEDS_FROM", "<YOUR_AGENT_WALLET>")}
+# BNB Chain mainnet (chain 56) SEEDS deployment; env SEEDS_<NAME> or --deployment FILE overrides.
+MAINNET = {"nft": "0x8d7E03C2dA2b532D4C59b46059443145147996D6", "game": "0xBE2C78e5c7aD8406A9dA36bd1d5f0F1Eea219D48", "market": "0xA52d300B25511cE5D40Ee06e94BdDDAb72C44b0a", "vault": "0xc79885D9B38344CA6bef3610B5Ec44feff24192B", "lens": "0xA97Dd8C78EBe6858fbBb043a45f4dE1350EB9A7E", "content": "0xd0DdDac59582e0919ad28662176F7befd7407227", "care": "0x5Bf6C48d396702cCaA0db98501436133A0bE7E6b", "rng": "0x57B5241f5B6f5fEFC9d0788ea2F511702891d99a"}
 for k in ("nft", "game", "market", "vault", "lens", "content", "care", "rng"):
-    CFG[k] = os.environ.get("SEEDS_" + k.upper(), "")
+    CFG[k] = os.environ.get("SEEDS_" + k.upper(), MAINNET[k] if CFG["chain"] == 56 else "")
 
 PRICES = {"bloom": 2 * 10**15, "fert": 5 * 10**14, "name": 5 * 10**14, "gift": 10**15, "graft": 10**15,
           "spin": 10**15, "ticket": 5 * 10**14, "pack": 3 * 10**15, "show": 10**15}
@@ -191,8 +196,8 @@ def bnb(s):
     return int(Decimal(str(s)) * 10**18)
 
 
-def rpc(method, params):
-    req = urllib.request.Request(CFG["rpc"], data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+def rpc(method, params, url=None):
+    req = urllib.request.Request(url or CFG["rpc"], data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
                                  headers={"Content-Type": "application/json", "User-Agent": "seeds.py"})
     r = json.loads(urllib.request.urlopen(req, timeout=30).read())
     if "error" in r:
@@ -565,6 +570,149 @@ def build(name, args):
     return r
 
 
+# ───────────────────────── reveal liveness: settle your own pending randomness ─────────────────────────
+FALLBACK_BLOCKS = 200  # SeedsRandom.FALLBACK_BLOCKS
+LOG_CHUNK = 5000       # blocks per eth_getLogs call (public BSC RPCs cap the range)
+
+
+def _t_uint(n):
+    return "0x" + int(n).to_bytes(32, "big").hex()
+
+
+def _t_addr(a):
+    return "0x" + "00" * 12 + a.lower().replace("0x", "").rjust(40, "0")
+
+
+def _topic0(sig):
+    return "0x" + keccak(sig.encode()).hex()
+
+
+# bsc-dataseed (the default SEEDS_RPC) refuses eth_getLogs ("limit exceeded"); log searches then use this endpoint
+LOGS_RPC = os.environ.get("SEEDS_LOGS_RPC") or {56: "https://bsc-rpc.publicnode.com",
+                                                 97: "https://bsc-testnet-rpc.publicnode.com"}.get(CFG["chain"], "")
+
+
+def _get_logs(f):
+    try:
+        return rpc("eth_getLogs", [f])
+    except SystemExit:
+        if not LOGS_RPC or LOGS_RPC == CFG["rpc"]:
+            raise
+        return rpc("eth_getLogs", [f], LOGS_RPC)
+
+
+def _logs_newest(address, topics, bn, blocks, first_only=False):
+    """eth_getLogs over the last `blocks` blocks, newest chunk first (stops at the first hit if first_only)."""
+    out, hi = [], bn
+    while hi > max(0, bn - blocks):
+        lo = max(0, bn - blocks, hi - LOG_CHUNK + 1)
+        r = _get_logs({"address": address, "topics": topics, "fromBlock": hex(lo), "toBlock": hex(hi)})
+        r = sorted(r, key=lambda x: (int(x["blockNumber"], 16), int(x.get("logIndex", "0x0"), 16)), reverse=True)
+        out += r
+        if first_only and out:
+            return out[:1]
+        hi = lo - 1
+    return out
+
+
+def _live_vrf(job):
+    """(vrfId, status) of a game job; vrfId is the current one (a retry() replaces it)."""
+    j = call("game", "jobInfo(uint256)", ["uint256"], [int(job)], ["(uint8,uint8,uint8,address,uint40,uint40,uint64,uint256)"])[0]
+    return j[7], j[1]
+
+
+def find_requests(wallet, token_ids=None, blocks=100000, spins=True):
+    """Randomness requests that belong to `wallet`: blooms/packs of its blooming flowers (or `token_ids`) and its
+    pending spins. Read-only: eth_getLogs + receipts. Returns [{requestId, job, source}]."""
+    bn = int(rpc("eth_blockNumber", []), 16)
+    if token_ids is None:
+        token_ids = []
+        for t in call("nft", "tokensOf(address)", ["address"], [wallet], ["uint256[]"])[0]:
+            st = dict(zip(STATE_K, call("nft", "state(uint256)", ["uint256"], [t], [STATE_T])[0]))
+            if st["blooming"] and not st["bloomed"]:
+                token_ids.append(t)
+    found, seen_jobs = [], set()
+    req_t0 = _topic0("Requested(uint256,uint8,uint256)")
+    for t in token_ids:
+        hit = _logs_newest(CFG["nft"], [[_topic0("BloomRequested(uint256,uint16)"), _topic0("PackOpened(uint256,address)")], _t_uint(t)],
+                           bn, blocks, first_only=True)
+        if not hit:
+            continue
+        rc = rpc("eth_getTransactionReceipt", [hit[0]["transactionHash"]])
+        for lg in rc.get("logs", []):
+            if lg["address"].lower() == CFG["game"].lower() and lg["topics"][0] == req_t0:
+                job = int(lg["topics"][1], 16)
+                if job in seen_jobs:
+                    continue
+                seen_jobs.add(job)
+                vrf, jst = _live_vrf(job)
+                if jst == 1:
+                    found.append({"requestId": vrf, "job": job, "source": "bloom #%d" % t})
+    if wallet and spins:
+        for lg in _logs_newest(CFG["game"], [_topic0("SpinPlaced(uint256,address,uint256)"), None, _t_addr(wallet)], bn, blocks):
+            job = int(lg["topics"][1], 16)
+            if job in seen_jobs:
+                continue
+            seen_jobs.add(job)
+            vrf, jst = _live_vrf(job)
+            if jst == 1:
+                found.append({"requestId": vrf, "job": job, "source": "spin job %d" % job})
+    return found
+
+
+def classify_request(p, created_block, bn, fb=FALLBACK_BLOCKS):
+    """p = SeedsRandom.pending(id) tuple (status, index, targetBlock, fallbackReady). Pure; returns (verdict, blocks_left).
+    verdict: done | fallback (send rng-fallback now) | settle (send rng-settle now) | wait | unknown"""
+    status, index, target, ready = p
+    if status == 3:
+        return "done", 0
+    if status == 1:
+        if ready:
+            return "fallback", 0
+        no_chain = index == (1 << 64) - 1
+        return "wait", max(1, (target if no_chain else created_block + fb) + 1 - bn)
+    if status == 2:
+        return ("settle", 0) if bn > target else ("wait", target + 1 - bn)
+    return "unknown", 0
+
+
+def settle_pending(wallet=None, token_ids=None, req_ids=None, blocks=100000, spins=True):
+    """One-shot liveness check for a player's own randomness. Prints nothing; returns a plan with ready-to-send
+    rng-fallback / rng-settle transactions (anyone may send them; they only need gas)."""
+    _rng()
+    reqs = [{"requestId": int(r), "job": None, "source": "requestId"} for r in (req_ids or [])]
+    if not req_ids:
+        reqs = find_requests(wallet, token_ids, blocks, spins)
+    bn = int(rpc("eth_blockNumber", []), 16)
+    out, txs = [], []
+    for r in reqs:
+        p = call("rng", "pending(uint256)", ["uint256"], [r["requestId"]], ["uint8", "uint64", "uint64", "bool"])
+        created = call("rng", "reqs(uint256)", ["uint256"], [r["requestId"]],
+                       ["address", "uint32", "uint8", "bool", "uint64", "uint64", "uint64", "bytes32", "bytes32"])[4]
+        verdict, left = classify_request(p, created, bn)
+        row = dict(r, status=p[0], verdict=verdict, blocksLate=max(0, bn - created) if p[0] == 1 else 0)
+        if verdict == "wait":
+            row["blocksLeft"] = left
+        if verdict in ("fallback", "settle"):
+            tx = build("rng-fallback" if verdict == "fallback" else "rng-settle", [str(r["requestId"])])
+            row["tx"] = tx; txs.append(tx)
+            row["log"] = ("reveal for %s is %d blocks late (operator silent): sending public fallbackFulfil(%d)"
+                          % (r["source"], row["blocksLate"], r["requestId"]) if verdict == "fallback" else
+                          "request %d has its value fixed but was re-targeted: sending settle(%d)" % (r["requestId"], r["requestId"]))
+        out.append(row)
+    res = {"block": bn, "requests": out, "transactions": txs}
+    if not out:
+        res["note"] = "no pending randomness found for this wallet (in the last %d blocks)" % blocks
+    elif txs:
+        res["note"] = "send each transaction (baw preview -> execute); it reveals now with blockhash + your commitment, no operator needed"
+    elif all(x["verdict"] == "done" for x in out):
+        res["note"] = "all found requests are already revealed: nothing to send"
+    else:
+        res["note"] = "operator still inside its %d-block window: check again in ~%d blocks" % (
+            FALLBACK_BLOCKS, min(x.get("blocksLeft", 1) for x in out if x["verdict"] == "wait"))
+    return res
+
+
 def read(name, a):
     if name == "rng-status":
         _rng()
@@ -619,6 +767,20 @@ def read(name, a):
         if code == 5:
             out["water_at"] = _now() + wait
             out["note"] = "not yet: the next water opens in %dh%02dm (water() reverts NotReady before then)" % (wait // 3600, wait % 3600 // 60)
+        if code == 4 and len(a) > 1 and int(a[1]) and os.environ.get("SEEDS_AUTO_FALLBACK", "1") != "0":
+            try:
+                plan = settle_pending(a[0], [int(a[1])], spins=False)  # this flower only: 1-8 getLogs
+                if plan["transactions"]:
+                    out["fallback"] = plan["transactions"]
+                    out["note"] = "; ".join(x["log"] for x in plan["requests"] if x.get("log")) + \
+                        " -> send the `fallback` tx(s) now (baw preview -> execute), then poll state %s" % a[1]
+                    print("[seeds] " + out["note"], file=sys.stderr)
+                else:
+                    left = [x["blocksLeft"] for x in plan["requests"] if x.get("blocksLeft")]
+                    out["note"] = ("reveal pending; operator has %d more blocks before the public fallback opens" % min(left)) if left \
+                        else "reveal pending: check again in a minute"
+            except (SystemExit, Exception) as e:  # never let the liveness check break next-action
+                out["note"] = "reveal pending (fallback check failed: %s); run `seeds.py settle-pending %s %s`" % (str(e)[:80], a[0], a[1])
         if code in (2, 5) and val:
             out["note"] = (out.get("note", "") + "; " if code == 5 else "") + "water fee %s BNB (%s)" % (f"{val / 1e18:.5f}", DROP_NOTE)
         return out
@@ -833,8 +995,7 @@ def main(argv):
         i = argv.index("--deployment")
         d = json.load(open(argv[i + 1]))
         for k in ("nft", "game", "market", "vault", "lens", "content", "care", "rng"):
-            if d.get(k):
-                CFG[k] = d[k]
+            CFG[k] = d.get(k) or os.environ.get("SEEDS_" + k.upper(), "")  # file replaces the mainnet defaults
         del argv[i:i + 2]
     jmode = "--json" in argv
     argv = [x for x in argv if x != "--json"]
@@ -877,9 +1038,29 @@ def main(argv):
                 print("%-4s  %-9s %s" % (a, b, c))
         if any(a == "FAIL" for a, _, _ in r):
             sys.exit(1)
+    elif cmd == "settle-pending":
+        args = list(args)
+        blocks = _opt(args, "--blocks", 100000)
+        reqs = None
+        if "--req" in args:
+            i = args.index("--req"); reqs = ids(args[i + 1]); del args[i:i + 2]
+        r = settle_pending(args[0] if args else (CFG["from"] if CFG["from"].startswith("0x") else None),
+                           ids(args[1]) if len(args) > 1 else None, reqs, blocks)
+        print(json.dumps(r, indent=None if jmode else 2, default=str))
+        if not jmode:
+            for x in r["requests"]:
+                if x.get("log"):
+                    print("[seeds] " + x["log"], file=sys.stderr)
+            print(r["note"])
     elif cmd == "selftest":
         assert keccak(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
         assert selector("transfer(address,uint256)").hex() == "a9059cbb"
+        M = (1 << 64) - 1
+        assert classify_request((1, 5, 110, True), 100, 400) == ("fallback", 0)
+        assert classify_request((1, 5, 110, False), 100, 250) == ("wait", 51)
+        assert classify_request((1, M, 110, False), 100, 105) == ("wait", 6)
+        assert classify_request((2, 5, 300, False), 100, 301) == ("settle", 0)
+        assert classify_request((3, 5, 110, False), 100, 999) == ("done", 0)
         print("ok")
     else:
         r = read(cmd, args)
