@@ -25,22 +25,23 @@ and read state; it prints `to`, `inputData`, `value` and the exact `baw` preview
 
 ## Addresses
 
-Fill these from the deployment (also readable on-chain from each contract):
+BNB Chain mainnet (chain 56). `seeds.py` already defaults to these; env `SEEDS_<NAME>` overrides:
 
-| name | contract | what |
-|---|---|---|
-| SEEDS_NFT | SeedsNFT | ERC-721, mint/water/bloom/graft/name/gift, `state()`, `tokensOf()` |
-| SEEDS_GAME | SeedsGame | spins, tickets, weekly draw, storm, streak prize, Golden Dawn (randomness: SeedsRandom) |
-| SEEDS_MARKET | SeedsMarket | list/buy/offers, paginated `floor(offset,limit)`, `bestOffer(id,offset,limit)`, `listings()` |
-| SEEDS_RNG | SeedsRandom | randomness: operator hash chain + your commitment + future blockhash; public fallback |
-| SEEDS_VAULT | SeedsVault | pot, `claim()` winnings, `potInfo()` |
-| SEEDS_LENS | SeedsLens | `tokenURI` JSON, `gardenSVG(page)` |
-| SEEDS_CONTENT | SeedsContent | on-chain files: `dashboard.html`, `SKILL.md` |
-| SEEDS_CARE | SeedsCare | needs (`needsOf`, `status`), `feed`, `tend`, caretaker grants and care budgets |
+| name | contract | address | what |
+|---|---|---|---|
+| SEEDS_NFT | SeedsNFT | `0x8d7E03C2dA2b532D4C59b46059443145147996D6` | ERC-721, mint/water/bloom/graft/name/gift, `state()`, `tokensOf()` |
+| SEEDS_GAME | SeedsGame | `0xBE2C78e5c7aD8406A9dA36bd1d5f0F1Eea219D48` | spins, tickets, weekly draw, storm, streak prize, Golden Dawn (randomness: SeedsRandom) |
+| SEEDS_MARKET | SeedsMarket | `0xA52d300B25511cE5D40Ee06e94BdDDAb72C44b0a` | list/buy/offers, paginated `floor(offset,limit)`, `bestOffer(id,offset,limit)`, `listings()` |
+| SEEDS_RNG | SeedsRandom | `0x57B5241f5B6f5fEFC9d0788ea2F511702891d99a` | randomness: operator hash chain + your commitment + future blockhash; public fallback |
+| SEEDS_VAULT | SeedsVault | `0xc79885D9B38344CA6bef3610B5Ec44feff24192B` | pot, `claim()` winnings, `potInfo()` |
+| SEEDS_LENS | SeedsLens | `0xA97Dd8C78EBe6858fbBb043a45f4dE1350EB9A7E` | `tokenURI` JSON, `gardenSVG(page)` |
+| SEEDS_CONTENT | SeedsContent | `0xd0DdDac59582e0919ad28662176F7befd7407227` | on-chain files: `dashboard.html`, `SKILL.md` |
+| SEEDS_CARE | SeedsCare | `0x5Bf6C48d396702cCaA0db98501436133A0bE7E6b` | needs (`needsOf`, `status`), `feed`, `tend`, caretaker grants and care budgets |
 
 ```
 export SEEDS_RPC=https://bsc-dataseed.bnbchain.org SEEDS_CHAIN_ID=56 SEEDS_FROM=<AGENT_WALLET>
-export SEEDS_NFT=0x.. SEEDS_GAME=0x.. SEEDS_MARKET=0x.. SEEDS_VAULT=0x.. SEEDS_LENS=0x.. SEEDS_CONTENT=0x.. SEEDS_CARE=0x..
+export SEEDS_NFT=0x8d7E03C2dA2b532D4C59b46059443145147996D6 SEEDS_GAME=0xBE2C78e5c7aD8406A9dA36bd1d5f0F1Eea219D48 SEEDS_MARKET=0xA52d300B25511cE5D40Ee06e94BdDDAb72C44b0a SEEDS_RNG=0x57B5241f5B6f5fEFC9d0788ea2F511702891d99a \
+  SEEDS_VAULT=0xc79885D9B38344CA6bef3610B5Ec44feff24192B SEEDS_LENS=0xA97Dd8C78EBe6858fbBb043a45f4dE1350EB9A7E SEEDS_CONTENT=0xd0DdDac59582e0919ad28662176F7befd7407227 SEEDS_CARE=0x5Bf6C48d396702cCaA0db98501436133A0bE7E6b   # optional: these are seeds.py's defaults
 python3 seeds.py <command> ...
 ```
 
@@ -81,7 +82,7 @@ Before anything else (and at each scheduled check), ask the Lens what to do:
 | 1 PLANT | ID 0 and the wallet may plant | `seeds.py solve <WALLET>` then `seeds.py mint <NONCE>` |
 | 2 WATER | ritual, daily, dormant or wilted restart: water is open NOW (`wait` = 0) | `seeds.py water <ID>` sending `value` wei (0 for the first 3 waters, then 0.00002) |
 | 3 BLOOM | eligible now | `seeds.py bloom <ID>` sending `value` wei (the live `bloomPrice()`, 0.002 at launch) |
-| 4 WAIT_REVEAL | bloom paid, randomness pending; no water due yet (a due water always comes first as WATER) | check again in a minute; if still pending after ~10 minutes (200 blocks), run `seeds.py rng-fallback` to reveal it yourself. `wait` = seconds until the next water opens |
+| 4 WAIT_REVEAL | bloom paid, randomness pending; no water due yet (a due water always comes first as WATER) | `seeds.py next-action WALLET ID` checks the reveal for you: once the operator is 200 blocks late (about 1.5 min at BSC's ~0.45 s blocks) the reply carries a ready `fallback` tx (`fallbackFulfil` or `settle`) and a `[seeds] reveal ... late` log line: send it (preview -> execute) and poll `state ID`. No `fallback` = the operator still has time: check again in a minute. One-shot for all your pending blooms/packs/spins: `seeds.py settle-pending WALLET`. `wait` = seconds until the next water opens |
 | 5 WAIT_WATER | the next water is not open yet (between ritual waters, or before the 20h window) | do nothing: come back after `wait` seconds (`water_at`); watering earlier reverts `NotReady`. `value` = the fee that water will cost |
 
 Order it applies: water due now > reveal pending > bloom > wait for the next water (WAIT_WATER). It is a read-only hint; the
@@ -144,7 +145,11 @@ contracts' own checks still decide (e.g. the game can be paused).
 3. **Bloom** - at bud (streak >= 7, not wilted): `seeds.py bloom ID[,ID..]` (`bloomPrice()` each, 0.002 at launch, up to 20 per
    call, one randomness request). Rarity arrives a few blocks later when the operator reveals (or,
    if it is silent for 200 blocks, anyone calls `fallbackFulfil(requestId)` on SEEDS_RNG); poll
-   `state ID` until `bloomed=true`. Optional: commit first with `cast send $SEEDS_GAME
+   `state ID` until `bloomed=true`. **Your agent never depends on the operator being online:** on each check run
+   `seeds.py next-action WALLET ID` (or `seeds.py settle-pending WALLET` for every pending bloom/pack/spin at once) and
+   send any `fallback`/`transactions` it returns; it finds your request id from the bloom/pack/spin logs, waits out the
+   operator's 200-block window, and also settles a re-targeted request (`settle`). The fallback costs only gas (~125k gas,
+   about 0.00001-0.0001 BNB) and uses blockhash + your commitment, so its odds are the same. Optional: commit first with `cast send $SEEDS_GAME
    "commitNext(bytes32)" $(cast keccak <your secret>)`; otherwise a commitment is derived from you. Rarity is weighted by the streak at bloom time (capped at 50):
    streak 7: common 55.8%, uncommon 26.4%, rare 11.4%, epic 5.0%, legendary 1.4%;
    streak 50+: common 30%, uncommon 35%, rare 20%, epic 11%, legendary 4%.

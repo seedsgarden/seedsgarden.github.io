@@ -326,7 +326,7 @@ Ask me before spending any BNB beyond gas.</pre>
     <h2>Seeds planted, top referrers and the Greenhouse ticker.</h2>
     <p class="sub">Read straight from BNB Chain in your browser. Referrers earn 10% of each bloom by the players they bring in.</p>
     <div class="live-grid">
-      <div class="card"><span class="ico">PLANTED</span><h3 id="live-planted">starts when planting opens oct 31</h3><p class="live-empty" id="live-planted-msg">seeds planted of 10,000 (totalMinted / MAX_SUPPLY)</p></div>
+      <div class="card"><span class="ico">PLANTED</span><h3 id="live-planted">starts when planting opens oct 31</h3><p class="live-empty" id="live-planted-msg">seeds planted, out of a 10,000 max supply</p></div>
       <div class="card"><span class="ico">FIRST SPROUT</span><h3 id="live-sprout">starts when planting opens oct 31</h3><p class="live-empty" id="live-sprout-msg">First Sprout badges left of 500 (first free seeds to finish the first-light ritual)</p></div>
     </div>
     <div class="live-grid">
@@ -430,59 +430,102 @@ Ask me before spending any BNB beyond gas.</pre>
 <img src="https://hits.sh/seedsgarden.github.io.svg" alt="" width="1" height="1" aria-hidden="true" loading="eager" referrerpolicy="no-referrer" style="position:absolute;left:-9999px;opacity:0">
 <script>
 /* SEEDS_LIVE_CONFIG: rpc must allow eth_getLogs (bsc-dataseed.bnbchain.org rejects every getLogs with "limit exceeded"; publicnode allows 5000-block ranges, checked 2026-10-29). the one spot for live-feed addresses. Fill nft (SeedsNFT, for the planted / First Sprout counters), vault, market and fromBlock (deploy block) at mainnet deploy; see DEPLOY_RUNBOOK.md. Empty = placeholder shown. */
-const SEEDS_LIVE = {rpc: "https://bsc-rpc.publicnode.com", nft: "", vault: "", market: "", fromBlock: 0, chunk: 5000, explorer: "https://bscscan.com"};
+const SEEDS_LIVE = {rpc: "https://bsc-rpc.publicnode.com", nft: "0x8d7E03C2dA2b532D4C59b46059443145147996D6", vault: "0xc79885D9B38344CA6bef3610B5Ec44feff24192B", market: "0xA52d300B25511cE5D40Ee06e94BdDDAb72C44b0a", fromBlock: 130546680, chunk: 5000, explorer: "https://bscscan.com"};
 (function(){
   const C = SEEDS_LIVE, T_REF = "0x3349e92a2f467dc55d843be6cc7f9d9a751b4cd966f0c4f6a614cf319c4d124c", /* ReferralCredited(address,address,uint256) on SeedsVault */
         T_SOLD = "0xb6c4b5e33d034d47fad5d227a642a2cc0ccfabc5d11c9a55157b4fc061b1e045", /* Sold(uint256,address,address,uint256,uint256,uint8,bool,uint256) on SeedsMarket */
         RAR = ["common","uncommon","rare","epic","legendary"], $ = id => document.getElementById(id);
   const isA = a => /^0x[0-9a-fA-F]{40}$/.test(a), hasNft = isA(C.nft), hasFeeds = isA(C.vault) && isA(C.market) && !!C.fromBlock;
   if (!hasNft && !hasFeeds) return; // pre-launch: keep placeholders
+  /* QA 2026-10-29: publicnode caps getLogs at 50,000 blocks (5,000 was a stale limit), so old configs with chunk 5000 are raised;
+     the span halves itself if an RPC rejects the range. HEAD_LAG keeps the cache off blocks a lagging node may not have yet. */
+  let SPAN = Math.min(C.chunk >= 10000 ? C.chunk : 45000, 50000);
+  const HEAD_LAG = 3, PAR = 4, MAX_BACK = 60, EVERY = 60000;
+  const setT = (id, t) => { const e = $(id); if (e) e.textContent = t; };
+  const orig = {}; for (const id of ["live-planted-msg", "live-sprout-msg"]) orig[id] = $(id) ? $(id).textContent : "";
+  if (hasNft) { setT("live-planted", "planted …"); setT("live-sprout", "First Sprout badges left …"); }
+  if (hasFeeds) { setT("live-refs-msg", "loading…"); setT("live-sales-msg", "loading…"); }
   let rid = 0;
-  const rpc = (m, p) => fetch(C.rpc, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({jsonrpc:"2.0", id:++rid, method:m, params:p})})
-    .then(r => r.json()).then(j => { if (j.error) throw new Error(j.error.message); return j.result; });
+  const rpc = (m, p) => { const ac = new AbortController(), to = setTimeout(() => ac.abort(), 12000);
+    return fetch(C.rpc, {method:"POST", headers:{"Content-Type":"application/json"}, signal: ac.signal, body:JSON.stringify({jsonrpc:"2.0", id:++rid, method:m, params:p})})
+      .then(r => r.json()).then(j => { if (j.error) throw new Error(j.error.message); return j.result; }).finally(() => clearTimeout(to)); };
   const hx = n => "0x" + n.toString(16), addr = t => "0x" + t.slice(26), short = a => a.slice(0,6) + "…" + a.slice(-4);
-  const bnb = w => (Number(w / 10n**12n) / 1e6).toFixed(4) + " BNB", word = (d, i) => BigInt("0x" + d.slice(2 + i*64, 2 + (i+1)*64));
-  const logs = (address, topic, a, b) => rpc("eth_getLogs", [{address, topics:[topic], fromBlock:hx(a), toBlock:hx(b)}]);
-  const link = (a, txt) => '<a href="' + C.explorer + '/address/' + a + '" rel="noopener">' + txt + '</a>';
-  async function refs(latest){
-    const key = "seedsRefs:" + C.vault.toLowerCase();
-    let st = {next: C.fromBlock, tot: {}};
-    try { const s = JSON.parse(localStorage.getItem(key)); if (s && s.next) st = s; } catch(e){}
-    for (let a = st.next; a <= latest; a += C.chunk) {
-      const b = Math.min(a + C.chunk - 1, latest);
-      for (const l of await logs(C.vault, T_REF, a, b)) { const r = addr(l.topics[1]); st.tot[r] = (BigInt(st.tot[r] || 0) + BigInt(l.data)).toString(); }
-      st.next = b + 1;
-    }
-    try { localStorage.setItem(key, JSON.stringify(st)); } catch(e){}
-    const top = Object.entries(st.tot).sort((x, y) => (BigInt(y[1]) > BigInt(x[1])) - (BigInt(y[1]) < BigInt(x[1]))).slice(0, 10);
-    $("live-refs").innerHTML = top.map(([a, w]) => "<li><span>" + link(a, short(a)) + "</span><span>" + bnb(BigInt(w)) + "</span></li>").join("");
-    $("live-refs-msg").textContent = top.length ? "" : "no referral earnings yet";
+  const bnb = w => (Number(w / 10n**12n) / 1e6).toFixed(5).replace(/\.?0+$/, "") + " BNB", word = (d, i) => BigInt("0x" + d.slice(2 + i*64, 2 + (i+1)*64));
+  async function logs(address, topic, a, b){
+    try { return await rpc("eth_getLogs", [{address, topics:[topic], fromBlock:hx(a), toBlock:hx(b)}]); }
+    catch(e){ if (/range|limit|exceed|too many|10000/i.test(e.message) && b - a > 1000) { SPAN = Math.max(1000, Math.floor(SPAN / 2));
+      const m = a + Math.floor((b - a) / 2); return (await logs(address, topic, a, m)).concat(await logs(address, topic, m + 1, b)); } throw e; }
   }
-  async function sales(latest){
-    let got = [];
-    for (let b = latest; b >= C.fromBlock && got.length < 10 && latest - b < C.chunk * 40; b -= C.chunk) {
-      const ls = await logs(C.market, T_SOLD, Math.max(C.fromBlock, b - C.chunk + 1), b);
-      got = got.concat(ls.reverse());
+  const link = (a, txt) => '<a href="' + C.explorer + '/address/' + a + '" rel="noopener">' + txt + '</a>';
+  const tok = id => hasNft ? '<a href="' + C.explorer + '/nft/' + C.nft + '/' + id + '" rel="noopener">#' + id + '</a>' : "#" + id;
+  const ago = ts => { if (!ts) return ""; const s = Math.max(0, Date.now()/1000 - ts); return s < 90 ? "now" : s < 5400 ? Math.round(s/60) + "m" : s < 129600 ? Math.round(s/3600) + "h" : Math.round(s/86400) + "d"; };
+  const load = k => { try { return JSON.parse(localStorage.getItem(k)); } catch(e){ return null; } }, save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} };
+  /* referral totals: one forward scan from fromBlock, cached per browser; later ticks fetch only new blocks */
+  async function refs(head){
+    const key = "seedsRefs2:" + C.vault.toLowerCase() + ":" + C.fromBlock;
+    const s = load(key), st = s && s.next ? s : {next: C.fromBlock, tot: {}};
+    while (st.next <= head) {
+      const ranges = []; for (let a = st.next, i = 0; a <= head && i < PAR; a += SPAN, i++) ranges.push([a, Math.min(a + SPAN - 1, head)]);
+      const res = await Promise.all(ranges.map(([a, b]) => logs(C.vault, T_REF, a, b)));
+      res.forEach(ls => { for (const l of ls) { const r = addr(l.topics[1]); st.tot[r] = (BigInt(st.tot[r] || 0) + BigInt(l.data)).toString(); } });
+      st.next = ranges[ranges.length - 1][1] + 1; save(key, st); drawRefs(st, st.next > head);
     }
-    got = got.slice(0, 10);
-    $("live-sales").innerHTML = got.map(l => { const id = BigInt(l.topics[1]), r = Number(word(l.data, 2)), g = word(l.data, 3) ? " golden" : "";
-      return "<li><span>#" + id + " " + (RAR[r] || "?") + g + " → " + link(addr(l.topics[3]), short(addr(l.topics[3]))) + "</span><span>" + bnb(word(l.data, 0)) + "</span></li>"; }).join("");
-    $("live-sales-msg").textContent = got.length ? "" : "no sales yet";
+    drawRefs(st, true);
+  }
+  function drawRefs(st, done){
+    const top = Object.entries(st.tot).sort((x, y) => (BigInt(y[1]) > BigInt(x[1])) - (BigInt(y[1]) < BigInt(x[1]))).slice(0, 10);
+    $("live-refs").innerHTML = top.map(([a, w], i) => "<li><span>" + (i + 1) + ". " + link(a, short(a)) + "</span><span>" + bnb(BigInt(w)) + "</span></li>").join("");
+    setT("live-refs-msg", top.length ? "" : done ? "no referral earnings yet" : "loading…");
+  }
+  /* latest 10 sales: first visit walks back from the head until 10 are found (max MAX_BACK spans), then only new blocks */
+  const sk = "seedsSales2:" + C.market.toLowerCase() + ":" + C.fromBlock;
+  const slim = l => ({id: BigInt(l.topics[1]).toString(), to: addr(l.topics[3]), p: word(l.data, 0).toString(), r: Number(word(l.data, 2)), g: word(l.data, 3) ? 1 : 0,
+    ts: l.blockTimestamp ? parseInt(l.blockTimestamp, 16) : 0, k: l.transactionHash + ":" + l.logIndex});
+  async function sales(head){
+    const s = load(sk); let st = s && s.next ? s : null;
+    if (!st) {
+      let got = [], b = head, n = 0;
+      while (b >= C.fromBlock && got.length < 10 && n < MAX_BACK) {
+        const ranges = []; for (let i = 0; i < PAR && b >= C.fromBlock; i++, b -= SPAN) ranges.push([Math.max(C.fromBlock, b - SPAN + 1), b]);
+        const res = await Promise.all(ranges.map(([x, y]) => logs(C.market, T_SOLD, x, y)));
+        for (const ls of res) got = got.concat(ls.slice().reverse().map(slim));
+        n += ranges.length;
+      }
+      st = {next: head + 1, list: got.slice(0, 10), full: b < C.fromBlock};
+    } else if (st.next <= head) {
+      let fresh = [];
+      for (let a = st.next; a <= head; a += SPAN) fresh = (await logs(C.market, T_SOLD, a, Math.min(a + SPAN - 1, head))).slice().reverse().map(slim).concat(fresh);
+      const seen = new Set(fresh.map(x => x.k));
+      st = {next: head + 1, list: fresh.concat(st.list.filter(x => !seen.has(x.k))).slice(0, 10), full: st.full};
+    }
+    save(sk, st);
+    $("live-sales").innerHTML = st.list.map(x => "<li><span>" + tok(x.id) + " " + (RAR[x.r] || "?") + (x.g ? " golden" : "") + " → " + link(x.to, short(x.to)) +
+      (x.ts ? ' <small style="color:var(--dim)">' + ago(x.ts) + "</small>" : "") + "</span><span>" + bnb(BigInt(x.p)) + "</span></li>").join("");
+    setT("live-sales-msg", st.list.length ? "" : st.full ? "no sales yet" : "no sales in the last few days");
   }
   /* counters: SeedsNFT.totalMinted()/MAX_SUPPLY() and FIRST_SPROUT_BADGES() - sproutCount() (badge goes to the first 500 free seeds that sprout) */
   const view = sel => rpc("eth_call", [{to: C.nft, data: sel}, "latest"]).then(BigInt), fmt = n => Number(n).toLocaleString("en-US");
   async function counters(){
     const [minted, max, sprouts, badges] = await Promise.all(["0xa2309ff8", "0x32cb6b0c", "0xc034e32c", "0x112f9673"].map(view));
-    $("live-planted").textContent = "planted " + fmt(minted) + " / " + fmt(max);
-    $("live-sprout").textContent = "First Sprout badges left " + fmt(sprouts >= badges ? 0n : badges - sprouts) + " / " + fmt(badges);
+    setT("live-planted", "planted " + fmt(minted) + " / " + fmt(max));
+    setT("live-sprout", sprouts >= badges ? "all " + fmt(badges) + " First Sprout badges taken" : "First Sprout badges left " + fmt(badges - sprouts) + " / " + fmt(badges));
+    setT("live-planted-msg", orig["live-planted-msg"]); setT("live-sprout-msg", orig["live-sprout-msg"]);
   }
+  let busy = false, last = 0;
   async function tick(){
-    if (hasNft) counters().catch(e => { $("live-planted-msg").textContent = "chain busy, retrying…"; });
-    if (!hasFeeds) return;
-    try { const latest = parseInt(await rpc("eth_blockNumber", []), 16); await Promise.all([refs(latest), sales(latest)]); }
-    catch(e) { if (!$("live-sales").children.length) $("live-sales-msg").textContent = "chain busy, retrying…"; }
+    if (busy || document.hidden) return; busy = true; last = Date.now();
+    try {
+      const jobs = [];
+      if (hasNft) jobs.push(counters().catch(e => setT("live-planted-msg", "chain busy, retrying…")));
+      if (hasFeeds) jobs.push(rpc("eth_blockNumber", []).then(h => { const head = parseInt(h, 16) - HEAD_LAG;
+        return Promise.all([refs(head).catch(e => { if (!$("live-refs").children.length) setT("live-refs-msg", "chain busy, retrying…"); }),
+                            sales(head).catch(e => { if (!$("live-sales").children.length) setT("live-sales-msg", "chain busy, retrying…"); })]); })
+        .catch(e => { for (const id of ["live-refs", "live-sales"]) if (!$(id).children.length) setT(id + "-msg", "chain busy, retrying…"); }));
+      await Promise.all(jobs);
+    } finally { busy = false; }
   }
-  tick(); setInterval(tick, 60000);
+  tick(); setInterval(tick, EVERY);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - last > EVERY) tick(); });
 })();
 </script>
 </body>
