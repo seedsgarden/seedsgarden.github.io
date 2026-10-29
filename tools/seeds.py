@@ -11,7 +11,7 @@ Config (env or --deployment FILE.json with keys nft, game, market, vault, lens, 
   SEEDS_NFT / SEEDS_GAME / SEEDS_MARKET / SEEDS_VAULT / SEEDS_LENS / SEEDS_CONTENT / SEEDS_CARE
 
 Write actions (print {to,inputData,value} + baw preview command; never sign anything):
-  mint NONCE | mint-ref REFERRER NONCE | pack | show-enter ID[,ID..] | show-request WEEK
+  mint NONCE | mint-ref REFERRER NONCE  [--from ADDR; pre-flight runs when SEEDS_FROM/--from set] | pack | show-enter ID[,ID..] | show-request WEEK
   water ID[,ID..] (sends the water fee due: first 3 waters of a seed free, then 0.00002 BNB each) | fertilize ID | bloom ID[,ID..] | graft KEEP BURN | name ID "Text"
   gift ADDR | spin N | tickets N | claim-tickets ID[,ID..] | storm | draw WEEK | streak-prize WEEK
   claim | list ID PRICE_BNB | cancel ID | buy ID PRICE_BNB | buy-cheapest MAX_BNB [SCAN]
@@ -31,9 +31,12 @@ Reads (JSON to stdout):
   state ID | tokens ADDR | pot | floor | best-offer ID | listings [OFFSET] [LIMIT] | owed ADDR | pow-params ADDR | germination ID
   week | draw-info WEEK | show-info WEEK | referrer ADDR | job JOB | dashboard OUT.html | skill
   needs ID | care-status ID | caretaker OWNER | care-budget OWNER
-  rng-status | rng-request REQ_ID | next-action WALLET [ID]   (agent's first call; ID 0 = no flower yet)
+  doctor [WALLET]   (read-only pre-plant check: rpc/chain, Agent ID, gas balance, planted, planting open, PoW speed; PASS/WARN/FAIL)
+  nudges ID   (advisory only: fertilizer when the window is at risk, bloom at bud stage, a name plate once after bloom)
+  rng-status | rng-request REQ_ID | next-action WALLET [ID]   (agent's first call; ID 0 = no flower yet;
+      actions NONE/PLANT/WATER(now)/BLOOM/WAIT_REVEAL/WAIT_WATER(come back after wait_seconds))
 Germination proof-of-work (multi-core, read-only; uses pycryptodome/eth_hash keccak if installed, else pure python):
-  solve ADDR [--workers N] [--bits B]   (reads nft.powParams(ADDR), searches on N processes, default all CPUs)
+  solve ADDR [--workers N] [--bits B] [--margin K]   (K extra bits of headroom; reads nft.powParams(ADDR), searches on N processes, default all CPUs)
   solve-bench BITS [--workers N] [--runs R]   (random inputs; prints mean seconds)
 Flags: --deployment FILE  --json (machine output only)
 """
@@ -207,6 +210,19 @@ def ids(s):
     return [int(x) for x in str(s).split(",") if x]
 
 
+def bloom_price():
+    """live SeedsNFT.bloomPrice() (owner may only lower it); older deployments: BLOOM_PRICE() constant"""
+    if "_bprice" not in CFG:
+        for sig in ("bloomPrice()", "BLOOM_PRICE()"):
+            try:
+                CFG["_bprice"] = call("nft", sig, [], [], ["uint256"])[0]; break
+            except SystemExit:
+                pass
+        else:
+            CFG["_bprice"] = PRICES["bloom"]
+    return CFG["_bprice"]
+
+
 WATER_FEE_DEFAULT = 2 * 10**13  # 0.00002 BNB, SeedsNFT.WATER_FEE
 DROP_NOTE = "+1 drop to the pot"
 
@@ -265,6 +281,180 @@ def care_water_fee(i, tend=False):
         return 0  # tend will only feed
     return fee
 
+# ───────────────────────── advisory nudges (read-only, never spend) ─────────────────────────
+NUDGE_RISK_SECONDS = 4 * 3600  # "window at risk": under ~4h before the flower wilts
+NUDGE_MAX_CHARGES = 3  # SeedsNFT.MAX_CHARGES
+NUDGE_SEEN_FILE = os.environ.get("SEEDS_NUDGE_FILE", os.path.join(os.path.expanduser("~"), ".seeds_nudges.json"))
+
+
+def live_price(sig, key):
+    """read a price constant from chain (e.g. FERTILIZER_PRICE()); falls back to the documented price"""
+    ck = "_p_" + key
+    if ck not in CFG:
+        try:
+            CFG[ck] = call("nft", sig, [], [], ["uint256"])[0]
+        except SystemExit:
+            CFG[ck] = PRICES[key]
+    return CFG[ck]
+
+
+def nudge_logic(st, now, prices, seen=()):
+    """pure: list of advisory nudges for one flower state dict (STATE_K keys).
+    prices: {"fert","name","bloom"} in wei. seen: nudge keys already shown (one-time nudges)."""
+    out = []
+    if not st.get("bloomed") and not st.get("wilted"):
+        left = st.get("wiltsAt", 0) - now
+        if 0 < left < NUDGE_RISK_SECONDS and st.get("charges", 0) < NUDGE_MAX_CHARGES:
+            out.append({"key": "fertilize", "action": "fertilize", "value_wei": prices["fert"],
+                        "note": "watering window closes in %dh%02dm and you hold %d/3 fertilizer charges: fertilizer (%s BNB) is "
+                                "streak insurance - it saves one missed window" % (left // 3600, left % 3600 // 60,
+                                st.get("charges", 0), f"{prices['fert'] / 1e18:.4f}")})
+        if st.get("stage") == 3 and not st.get("blooming"):
+            out.append({"key": "bloom", "action": "bloom", "value_wei": prices["bloom"],
+                        "note": "bud stage reached: bloom now for %s BNB (live bloomPrice) to reveal its rarity" % f"{prices['bloom'] / 1e18:.4f}"})
+    if st.get("bloomed") and not st.get("name") and "name" not in seen:
+        out.append({"key": "name", "action": "name", "value_wei": prices["name"], "once": True,
+                    "note": "bloomed! give it a name plate for %s BNB (shown on the flower)" % f"{prices['name'] / 1e18:.4f}"})
+    return out
+
+
+def nudges(i):
+    st = dict(zip(STATE_K, call("nft", "state(uint256)", ["uint256"], [i], [STATE_T])[0]))
+    prices = {"fert": live_price("FERTILIZER_PRICE()", "fert"), "name": live_price("NAME_PRICE()", "name"), "bloom": bloom_price()}
+    try:
+        seen_all = json.load(open(NUDGE_SEEN_FILE))
+    except (OSError, ValueError):
+        seen_all = {}
+    key = "%s:%d" % (CFG.get("nft", "").lower(), i)
+    seen = seen_all.get(key, [])
+    out = nudge_logic(st, _now(), prices, seen)
+    once = [n["key"] for n in out if n.get("once")]
+    if once:
+        seen_all[key] = sorted(set(seen) | set(once))
+        try:
+            json.dump(seen_all, open(NUDGE_SEEN_FILE, "w"))
+        except OSError:
+            pass
+    return {"id": i, "advisory": "suggestions only; nothing is sent - build the action yourself if you agree", "nudges": out}
+
+
+# ───────────────────────── doctor: read-only pre-plant check ─────────────────────────
+PLANT_OPENS_AT = int(os.environ.get("SEEDS_OPENS_AT", "1793451600"))  # announced Oct 31, 2026 13:00 UTC (off-chain; used only while paused)
+# gas units measured on anvil (gas_costs.md): first-ever plant 368,619 + ritual waters 36,881 + 36,951 + 57,023
+DOCTOR_PLANT_GAS = 368_619 + 36_881 + 36_951 + 57_023
+DOCTOR_MARGIN = 1.5  # want 1.5x the estimate in the wallet
+DOCTOR_GAS_FALLBACK = 10**9  # 1 gwei, only if eth_gasPrice fails
+
+
+def _hms(s):
+    s = int(max(0, s)); d, s = divmod(s, 86400); h, s = divmod(s, 3600); m = s // 60
+    return ("%dd " % d if d else "") + "%dh %02dm" % (h, m)
+
+
+def pow_bench(seconds=3.0):
+    """single-core keccak rate (hashes/s) over ~`seconds`, with the same 192-byte input the solver hashes"""
+    import time
+    k, pre, n = _fast_keccak(), os.urandom(160), 0
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        for _ in range(256):
+            k(pre + n.to_bytes(32, "big")); n += 1
+    return n / (time.time() - t0), k is keccak
+
+
+def doctor(wallet=None, bench_seconds=3.0, cpus=None):
+    """returns [(level, check, message)], level PASS/WARN/FAIL. Reads only; never signs or sends."""
+    out = []
+    add = lambda lv, c, m: out.append((lv, c, m))
+    wallet = wallet or CFG["from"]
+    if not wallet or not wallet.startswith("0x") or len(wallet) != 42:
+        add("FAIL", "wallet", "give a wallet address: seeds.py doctor 0xYOURWALLET (or set SEEDS_FROM)")
+        return out
+    # 1. rpc + chain id
+    try:
+        cid = int(rpc("eth_chainId", []), 16)
+    except BaseException as e:  # rpc() raises SystemExit on rpc errors
+        add("FAIL", "rpc", "%s unreachable (%s)" % (CFG["rpc"], str(e)[:80]))
+        return out
+    if cid == CFG["chain"]:
+        add("PASS", "rpc", "%s reachable, chain id %d matches" % (CFG["rpc"], cid))
+    else:
+        add("FAIL", "rpc", "chain id %d but config expects %d (check SEEDS_RPC / SEEDS_CHAIN_ID)" % (cid, CFG["chain"]))
+    if not CFG["nft"]:
+        add("FAIL", "config", "SEEDS_NFT not set (use --deployment FILE or SEEDS_NFT=...)")
+        if _now() < PLANT_OPENS_AT:
+            add("WARN", "planting", "contracts not configured yet; planting opens in %s (oct 31, 13:00 UTC)" % _hms(PLANT_OPENS_AT - _now()))
+        return out
+    # 2. Agent ID (same registry + agentKey() the contract's mint uses)
+    bits, eligible = None, False
+    try:
+        reg = call("nft", "agentRegistry()", [], [], ["address"])[0]
+        ok, _key = call("nft", "agentKey(address)", ["address"], [wallet], ["bool", "bytes32"])
+        if ok:
+            add("PASS", "agent-id", "wallet holds a .ai Agent ID in registry %s" % reg)
+        else:
+            add("FAIL", "agent-id", "no Agent ID in registry %s (mint reverts NoAgentId)" % reg)
+        _c, _n, _a, _s, bits, eligible = call("nft", "powParams(address)", ["address"], [wallet],
+                                              ["uint256", "address", "bytes32", "bytes32", "uint256", "bool"])
+    except BaseException as e:
+        add("FAIL", "agent-id", "could not read the Agent ID gate (%s)" % str(e)[:80])
+    # 3. balance vs gas
+    try:
+        gp = int(rpc("eth_gasPrice", []), 16)
+    except BaseException:
+        gp = DOCTOR_GAS_FALLBACK
+    try:
+        bal = int(rpc("eth_getBalance", [wallet, "latest"]), 16)
+        need = DOCTOR_PLANT_GAS * gp
+        want = int(need * DOCTOR_MARGIN)
+        msg = "%.6f BNB; plant + 3 ritual waters ~%.6f BNB at %.2f gwei (waters 1-3 are free, gas only)" % (
+            bal / 1e18, need / 1e18, gp / 1e9)
+        add("PASS" if bal >= want else "WARN" if bal >= need else "FAIL", "balance",
+            msg + ("" if bal >= want else "; top up to >= %.6f BNB" % (want / 1e18)))
+    except BaseException as e:
+        add("FAIL", "balance", "could not read balance (%s)" % str(e)[:80])
+    # 4. already planted?
+    try:
+        if call("nft", "walletClaimed(address)", ["address"], [wallet], ["bool"])[0]:
+            add("FAIL", "planted", "this wallet already planted its free seed (mint reverts AlreadyClaimed)")
+        elif bits is not None and not eligible:
+            add("FAIL", "planted", "this Agent ID already planted from another wallet (or has no Agent ID)")
+        else:
+            add("PASS", "planted", "not planted yet")
+    except BaseException as e:
+        add("FAIL", "planted", "could not read walletClaimed (%s)" % str(e)[:80])
+    # 5. planting open (whenLive = vault not paused)
+    try:
+        v = call("nft", "vault()", [], [], ["address"])[0]
+        paused = decode(["bool"], bytes.fromhex(rpc("eth_call", [{"to": v, "data": "0x" + selector("paused()").hex()}, "latest"])[2:]))[0]
+        if not paused:
+            add("PASS", "planting", "planting is open")
+        else:
+            left = PLANT_OPENS_AT - _now()
+            add("WARN" if left > 0 else "FAIL", "planting",
+                "not open yet: opens in %s (oct 31, 13:00 UTC)" % _hms(left) if left > 0 else "vault is paused (planting halted)")
+    except BaseException as e:
+        add("FAIL", "planting", "could not read vault.paused() (%s)" % str(e)[:80])
+    # 6. PoW speed
+    if bits is None:
+        try:
+            bits = call("nft", "powBits()", [], [], ["uint256"])[0]
+        except BaseException:
+            bits = 25
+    rate, pure = pow_bench(bench_seconds)
+    cpus = int(cpus or os.cpu_count() or 1)
+    exp = 2 ** bits
+    est = lambda w: exp / (rate * w)
+    rec = next((w for w in range(1, cpus + 1) if est(w) <= 120), cpus)
+    m = "%d bits, %.0f hashes/s per core%s; expected solve ~%s with --workers %d (of %d CPUs)" % (
+        bits, rate, " (pure-python keccak)" if pure else "", _hms(est(rec)) if est(rec) >= 60 else "%ds" % est(rec), rec, cpus)
+    if est(rec) > 3600:
+        add("WARN", "pow", m + "; too slow: pip install pycryptodome (about 100x faster), or use a bigger machine")
+    else:
+        add("PASS", "pow", m + "; run: seeds.py solve %s --workers %d" % (wallet, rec))
+    return out
+
+
 # ───────────────────────── actions ─────────────────────────
 ACTIONS = {
     # name: (contract, signature, types, argfn(args)->values, valuefn(args)->wei)
@@ -275,7 +465,7 @@ ACTIONS = {
     "show-request": ("game", "requestShow(uint256)", ["uint256"], lambda a: [int(a[0])], lambda a: 0),
     "water": ("nft", "water(uint256[])", ["uint256[]"], lambda a: [ids(a[0])], lambda a: water_plan(ids(a[0]))[0]),
     "fertilize": ("nft", "fertilize(uint256)", ["uint256"], lambda a: [int(a[0])], lambda a: PRICES["fert"]),
-    "bloom": ("nft", "bloom(uint256[])", ["uint256[]"], lambda a: [ids(a[0])], lambda a: PRICES["bloom"] * len(ids(a[0]))),
+    "bloom": ("nft", "bloom(uint256[])", ["uint256[]"], lambda a: [ids(a[0])], lambda a: bloom_price() * len(ids(a[0]))),
     "graft": ("nft", "graft(uint256,uint256)", ["uint256", "uint256"], lambda a: [int(a[0]), int(a[1])], lambda a: PRICES["graft"]),
     "name": ("nft", "setName(uint256,string)", ["uint256", "string"], lambda a: [int(a[0]), a[1]], lambda a: PRICES["name"]),
     "gift": ("nft", "gift(address)", ["address"], lambda a: [a[0]], lambda a: PRICES["gift"]),
@@ -421,11 +611,19 @@ def read(name, a):
     if name == "next-action":
         r = call("lens", "nextAction(address,uint256)", ["address", "uint256"], [a[0], int(a[1]) if len(a) > 1 else 0],
                  ["uint8", "uint256", "uint256"])
-        names = ["NONE", "PLANT", "WATER", "BLOOM", "WAIT_REVEAL"]
-        out = {"action": names[r[0]] if r[0] < len(names) else r[0], "code": r[0], "wait_seconds": r[1], "value_wei": r[2]}
-        if r[0] == 2 and r[2]:
-            out["note"] = "water fee %s BNB (%s)" % (f"{r[2] / 1e18:.5f}", DROP_NOTE)
+        names = ["NONE", "PLANT", "WATER", "BLOOM", "WAIT_REVEAL", "WAIT_WATER"]
+        code, wait, val = r
+        if code == 2 and wait:  # older Lens (no WAIT_WATER): WATER with a wait means "not yet"
+            code = 5
+        out = {"action": names[code] if code < len(names) else code, "code": code, "wait_seconds": wait, "value_wei": val}
+        if code == 5:
+            out["water_at"] = _now() + wait
+            out["note"] = "not yet: the next water opens in %dh%02dm (water() reverts NotReady before then)" % (wait // 3600, wait % 3600 // 60)
+        if code in (2, 5) and val:
+            out["note"] = (out.get("note", "") + "; " if code == 5 else "") + "water fee %s BNB (%s)" % (f"{val / 1e18:.5f}", DROP_NOTE)
         return out
+    if name == "nudges":
+        return nudges(int(a[0]))
     if name == "germination":
         r = call("nft", "germination(uint256)", ["uint256"], [int(a[0])], ["uint8", "uint40", "uint8", "uint40", "uint40"])
         return dict(zip(["status(0 sprouted,1 germinating,2 dormant)", "startedAt", "waters", "nextWaterAt", "deadline"], r))
@@ -482,7 +680,7 @@ def read(name, a):
 
 # ───────────────────────── germination PoW solver (multiprocessing) ─────────────────────────
 def _fast_keccak():
-    for d in ("/workspace/tools/py",):  # optional vendored pycryptodome
+    for d in tuple(p for p in [os.environ.get("SEEDS_PYLIB")] if p):  # optional vendored pycryptodome dir
         if os.path.isdir(d) and d not in sys.path:
             sys.path.append(d)
     try:
@@ -507,11 +705,12 @@ def _pow_worker(pre, bits, start, step, q, stop):
             n += step
 
 
-def pow_solve(pre, bits, workers=None):
-    """Return the first nonce with keccak(pre||nonce) < 2^(256-bits), searched on `workers` processes."""
+def pow_solve(pre, bits, workers=None, start=None):
+    """Return a nonce with keccak(pre||nonce) < 2^(256-bits), searched on `workers` processes from `start` (default random)."""
     import multiprocessing as mp
     workers = max(1, int(workers or os.cpu_count() or 1))
-    start = int.from_bytes(os.urandom(8), "big") << 64
+    if start is None:
+        start = int.from_bytes(os.urandom(8), "big") << 64
     q, stop = mp.Queue(), mp.Event()
     ps = [mp.Process(target=_pow_worker, args=(pre, bits, start + i, workers, q, stop), daemon=True) for i in range(workers)]
     for p in ps:
@@ -543,16 +742,90 @@ def solve_cmd(cmd, args):
         return {"bits": bits, "workers": workers, "runs": runs, "seconds": [round(x, 1) for x in ts],
                 "mean_seconds": round(sum(ts) / len(ts), 1)}
     bits_override = _opt(args, "--bits", None)
+    margin = _opt(args, "--margin", 0)
     who = args[0]
     cid, nft, agent, salt, bits, ok = call("nft", "powParams(address)", ["address"], [who],
                                            ["uint256", "address", "bytes32", "bytes32", "uint256", "bool"])
     if not ok:
         raise SystemExit("wallet not eligible (no Agent ID, or already planted)")
-    bits = bits_override or bits
+    bits = (bits_override or bits) + margin
     pre = encode(["uint256", "address", "address", "bytes32", "bytes32"], [cid, nft, who, agent, salt])
     t = time.time(); n = pow_solve(pre, bits, workers)
-    return {"nonce": n, "bits": bits, "workers": workers, "seconds": round(time.time() - t, 1),
-            "next": "seeds.py mint %d   (or mint-ref REFERRER %d)" % (n, n)}
+    r = {"nonce": n, "bits": bits, "workers": workers, "seconds": round(time.time() - t, 1),
+         "next": "seeds.py mint %d   (or mint-ref REFERRER %d)" % (n, n)}
+    if margin:
+        r["margin"] = margin
+    left = (3600 - _now() % 3600) // 60
+    r["minutesLeftInHour"] = left
+    r["note"] = ("difficulty can move 1 bit at the top of each UTC hour (%dm left); the salt is fixed for the season, "
+                 "so this nonce stays valid unless difficulty rises" % left)
+    if left < 10 and not margin:
+        r["tip"] = "under 10 min left in this UTC hour: re-run with --margin 1 so the nonce survives a +1 bit step"
+    return r
+
+
+# ───────────────────────── mint pre-flight (read-only: eth_call, never sends) ─────────────────────────
+NFT_ERRORS = {"BadPow()": None, "AlreadyClaimed()": "this wallet (or its Agent ID) already planted: nothing to do, don't send",
+              "NoAgentId()": "this wallet has no Agent ID: register one first (see SKILL.md), then solve again",
+              "Paused()": "planting is paused / not open yet: wait for opening, your nonce stays valid",
+              "BlockCap()": "this block's plant cap is full: try next block (re-run in a few seconds)",
+              "HourCap()": None, "SoldOut()": "sold out: all seeds are planted",
+              "BadReferrer()": "bad referrer (yourself, same Agent ID, or no Agent ID): use plain `mint NONCE` or another referrer"}
+ERR_BY_SEL = {"0x" + selector(k).hex(): k for k in NFT_ERRORS}
+
+
+def _lz(b):
+    v = int(b, 16) if isinstance(b, str) else int.from_bytes(b, "big")
+    return 256 - v.bit_length()
+
+
+def _sim(wallet, data):
+    """eth_call the mint from `wallet`. Returns None on success, else the error name (or raw message)."""
+    try:
+        rpc("eth_call", [{"from": wallet, "to": CFG["nft"], "data": data}, "latest"])
+        return None
+    except SystemExit as e:
+        msg = str(e)
+        try:
+            err = json.loads(msg.split("rpc error: ", 1)[1])
+            d = err.get("data")
+            d = d.get("data", "") if isinstance(d, dict) else (d or "")
+        except Exception:
+            d = msg
+        for sel, name in ERR_BY_SEL.items():
+            if sel in str(d) or sel in msg:
+                return name
+        return "revert: " + msg[:200]
+
+
+def preflight(name, args, wallet, workers=None, max_resolves=3):
+    """Returns (args, notes) with a valid nonce, or raises SystemExit(fix line). Read-only."""
+    args = list(args); notes = []
+    ni = 0 if name == "mint" else 1
+    for attempt in range(max_resolves + 1):
+        nonce = int(args[ni])
+        cid, nft, agent, salt, bits, ok = call("nft", "powParams(address)", ["address"], [wallet],
+                                               ["uint256", "address", "bytes32", "bytes32", "uint256", "bool"])
+        dig = call("nft", "powDigest(address,bytes32,uint256)", ["address", "bytes32", "uint256"], [wallet, agent, nonce], ["bytes32"])[0]
+        err = "BadPow()" if _lz(dig) < bits else None
+        if err is None:
+            c, sig, types, af, vf = ACTIONS[name]
+            err = _sim(wallet, "0x" + (selector(sig) + encode(types, af(args))).hex())
+        if err is None:
+            notes.append("pre-flight ok: nonce %d meets %d bits, simulated mint from %s succeeds" % (nonce, bits, wallet))
+            return args, notes
+        if err != "BadPow()" or attempt == max_resolves:
+            if err == "HourCap()":
+                raise SystemExit("pre-flight: this UTC hour's plant cap is full: try next hour, in %dm. Don't send now."
+                                 % ((3600 - _now() % 3600 + 59) // 60))
+            if err == "BadPow()":
+                raise SystemExit("pre-flight: nonce still fails PoW after %d re-solves: run `seeds.py solve %s --margin 1`" % (max_resolves, wallet))
+            raise SystemExit("pre-flight: " + NFT_ERRORS.get(err, err) + (". Don't send this mint." if err in NFT_ERRORS else ""))
+        pre = encode(["uint256", "address", "address", "bytes32", "bytes32"], [cid, nft, wallet, agent, salt])
+        new = pow_solve(pre, bits, workers, start=nonce + 1)
+        notes.append("pre-flight: nonce %d fails at %d bits (difficulty rose or nonce used); re-solved from %d -> nonce %d"
+                     % (nonce, bits, nonce + 1, new))
+        args[ni] = str(new)
 
 
 def main(argv):
@@ -569,12 +842,41 @@ def main(argv):
         print(__doc__); return
     cmd, args = argv[0], argv[1:]
     if cmd in ACTIONS:
+        notes = []
+        if cmd in ("mint", "mint-ref"):
+            args = list(args)
+            wallet = None
+            if "--from" in args:
+                i = args.index("--from"); wallet = args[i + 1]; del args[i:i + 2]; CFG["from"] = wallet
+            elif os.environ.get("SEEDS_FROM"):
+                wallet = CFG["from"]
+            if wallet and CFG["nft"]:
+                args, notes = preflight(cmd, args, wallet)
+            else:
+                print("tip: set SEEDS_FROM (or --from ADDR) to pre-flight this mint and avoid a wasted-gas revert", file=sys.stderr)
         r = build(cmd, args)
+        if notes:
+            r["preflight"] = notes
         print(json.dumps(r, indent=None if jmode else 2))
         if not jmode and r.get("note"):
             print(r["note"])
+        if not jmode:
+            for x in notes:
+                print(x)
     elif cmd in ("solve", "solve-bench"):
-        print(json.dumps(solve_cmd(cmd, args), indent=None if jmode else 2))
+        r = solve_cmd(cmd, args)
+        print(json.dumps(r, indent=None if jmode else 2))
+        if not jmode and r.get("tip"):
+            print(r["tip"])
+    elif cmd == "doctor":
+        r = doctor(args[0] if args else None)
+        if jmode:
+            print(json.dumps([{"level": a, "check": b, "message": c} for a, b, c in r]))
+        else:
+            for a, b, c in r:
+                print("%-4s  %-9s %s" % (a, b, c))
+        if any(a == "FAIL" for a, _, _ in r):
+            sys.exit(1)
     elif cmd == "selftest":
         assert keccak(b"").hex() == "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
         assert selector("transfer(address,uint256)").hex() == "a9059cbb"
