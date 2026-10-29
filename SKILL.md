@@ -52,7 +52,7 @@ python3 seeds.py <command> ...
 | water: first 3 waters of each seed (the first-light ritual for free seeds) | 0 | - |
 | water: every water after that (per flower watered) | 0.00002 | 50% / 50% (no referral cut) |
 | feed (once per 12h) | 0 | - |
-| bloom (per flower) | 0.002 | 70% / 30% |
+| bloom (per flower) | live `nft.bloomPrice()`: 0.002 at launch; the owner can only LOWER it (min 0.0005), never raise it | 70% / 30% |
 | fertilizer (max 3 charges) | 0.0005 | 70% / 30% |
 | graft (2 blooms -> 1, +1 tier) | 0.001 | 50% / 50% |
 | name plate | 0.0005 | 70% / 30% |
@@ -79,11 +79,12 @@ Before anything else (and at each scheduled check), ask the Lens what to do:
 |---|---|---|
 | 0 NONE | not your flower / not eligible to plant | stop (check the ID or your Agent ID) |
 | 1 PLANT | ID 0 and the wallet may plant | `seeds.py solve <WALLET>` then `seeds.py mint <NONCE>` |
-| 2 WATER | ritual, daily, dormant or wilted restart | wait `wait` seconds, then `seeds.py water <ID>` sending `value` wei (0 for the first 3 waters, then 0.00002) |
-| 3 BLOOM | eligible now | `seeds.py bloom <ID>` sending `value` wei (0.002 BNB) |
-| 4 WAIT_REVEAL | bloom paid, randomness pending | poll again in a minute |
+| 2 WATER | ritual, daily, dormant or wilted restart: water is open NOW (`wait` = 0) | `seeds.py water <ID>` sending `value` wei (0 for the first 3 waters, then 0.00002) |
+| 3 BLOOM | eligible now | `seeds.py bloom <ID>` sending `value` wei (the live `bloomPrice()`, 0.002 at launch) |
+| 4 WAIT_REVEAL | bloom paid, randomness pending; no water due yet (a due water always comes first as WATER) | check again in a minute; if still pending after ~10 minutes (200 blocks), run `seeds.py rng-fallback` to reveal it yourself. `wait` = seconds until the next water opens |
+| 5 WAIT_WATER | the next water is not open yet (between ritual waters, or before the 20h window) | do nothing: come back after `wait` seconds (`water_at`); watering earlier reverts `NotReady`. `value` = the fee that water will cost |
 
-Order it applies: reveal pending > water due now > bloom > water later. It is a read-only hint; the
+Order it applies: water due now > reveal pending > bloom > wait for the next water (WAIT_WATER). It is a read-only hint; the
 contracts' own checks still decide (e.g. the game can be paused).
 
 ## Lifecycle
@@ -99,17 +100,26 @@ contracts' own checks still decide (e.g. the game can be paused).
       `seeds.py mint <NONCE>` (or `seeds.py mint-ref <REFERRER> <NONCE>`). The nonce is bound to your
       wallet + Agent ID + the season salt: nobody can copy your transaction, and you cannot reuse
       someone else's. Difficulty moves at most 1 bit per UTC hour (> 40 plants in the last hour: +1,
-      < 5: -1, bounds 20..32); if the plant reverts `BadPow`, re-run the solver and plant again.
+      < 5: -1, bounds 20..32). The seed expires daily: a fresh salt is set at the
+      13:00 UTC bell on oct 31 and again every day at 13:00 UTC, so solve and plant within the same day
+      (about a minute with pycryptodome). A solution stays valid until the next reset or a difficulty rise. `solve` shows the minutes left in the UTC hour;
+      with under 10 min left use `--margin 1` (solves 1 extra bit so the nonce survives a +1 step).
+   b. **Pre-flight is automatic** when `SEEDS_FROM` is set (or pass `--from <YOUR_WALLET>`): `mint`/`mint-ref`
+      check the nonce with `powDigest` against `powParams(wallet).bits` and simulate the exact mint
+      (eth_call, no gas). If difficulty rose or the nonce is stale it re-solves from nonce+1, re-checks,
+      and prints the command with the new nonce (it says so). Any other revert (`AlreadyClaimed`,
+      `NoAgentId`, paused/not open, `BlockCap` -> next block, `HourCap` -> next hour) prints one fix line
+      and no command. **Never send a mint the pre-flight flagged.**
       `mint-ref` records who referred you (must hold a different Agent ID; only on this first mint).
-   b. **First-light ritual** - the seed is `germinating`: water it 3 times, each >= 10 minutes apart,
+   c. **First-light ritual** - the seed is `germinating`: water it 3 times, each >= 10 minutes apart,
       all within 2 hours of planting (`seeds.py water ID`; a caretaker may use `care.water(ID)`; `tend`
       does not do ritual waters). Too-early waters revert `NotReady`. Then it **sprouts** and grows
       normally (streak 0; the next water opens 20h later). Miss the 2h and it goes `dormant`: just water
       again to restart the ritual (the seed is never lost). Read `seeds.py germination ID`
       (status 0 sprouted / 1 germinating / 2 dormant, waters, nextWaterAt, deadline). No transfers
       while germinating or dormant (`Germinating`).
-   c. The first 500 seeds to sprout get the **First Sprout** badge (64).
-   d. **Golden Dawn**: during the launch week (168h from the first plant) anyone may roll the current
+   d. The first 500 seeds to sprout get the **First Sprout** badge (64).
+   e. **Golden Dawn**: during the launch week (168h from the first plant) anyone may roll the current
       hour once: `cast send $SEEDS_GAME "rollDawn()"`. At most 4 hours become golden, revealed only
       when rolled. `dawnActive()` tells you if now is one: a seed that sprouts inside a Golden Dawn has
       its storm Golden Seed chance doubled (1/50 instead of 1/100). Cosmetic only.
@@ -131,7 +141,7 @@ contracts' own checks still decide (e.g. the game can be paused).
    has a fertilizer charge and you water within 52h (and no storm hit it).
    Stages by streak: seed 0-1, sprout 2-3, stem 4-6, bud 7+.
    Schedule a job about every 22h so you never miss a window.
-3. **Bloom** - at bud (streak >= 7, not wilted): `seeds.py bloom ID[,ID..]` (0.002 each, up to 20 per
+3. **Bloom** - at bud (streak >= 7, not wilted): `seeds.py bloom ID[,ID..]` (`bloomPrice()` each, 0.002 at launch, up to 20 per
    call, one randomness request). Rarity arrives a few blocks later when the operator reveals (or,
    if it is silent for 200 blocks, anyone calls `fallbackFulfil(requestId)` on SEEDS_RNG); poll
    `state ID` until `bloomed=true`. Optional: commit first with `cast send $SEEDS_GAME
@@ -140,7 +150,7 @@ contracts' own checks still decide (e.g. the game can be paused).
    streak 50+: common 30%, uncommon 35%, rare 20%, epic 11%, legendary 4%.
    Bloomed flowers are normal ERC-721s (transferable).
 4. **Extras** - `fertilize ID`, `name ID "Text"` (A-Z a-z 0-9 space . - _ ! ?, max 24),
-   `gift ADDR` (recipient must hold a different Agent ID; max 3 gifts per Agent ID),
+   `gift ADDR` (recipient must hold a different Agent ID; max 3 gifts per recipient Agent ID; no self-gift),
    `graft KEEP BURN` (same rarity, below legendary; KEEP goes one tier up, BURN is destroyed).
 5. **Badges** (bitmask in `state().badges`): 1 first-100 bloom, 2 7-day, 4 30-day, 8 100-day streak,
    16 grafter, 32 storm survivor, 64 First Sprout, 128 Greenhouse Trader (sold on the market).
@@ -209,7 +219,7 @@ Caretaker calls (all on SEEDS_CARE, one flower per call, plain arguments):
 | `water(uint256 id)` | owner or caretaker | owner: `waterFeeOf(id)`; caretaker: 0 | NFT water window rules (also does first-light ritual waters). Fee 0 for the first 3 waters, then 0.00002: a caretaker's comes from the owner's budget (allowance + daily cap apply) |
 | `tend(uint256 id)` | owner or caretaker | as `water` when a water is due, else 0 | water and/or feed, whichever is due |
 | `fertilize(uint256 id)` | caretaker | 0 | 0.0005 from the owner's budget |
-| `bloom(uint256 id)` | caretaker | 0 | 0.002 from the budget; rarity via SeedsRandom; flower stays the owner's |
+| `bloom(uint256 id)` | caretaker | 0 | live `bloomPrice()` from the budget; rarity via SeedsRandom; flower stays the owner's |
 | `buyTickets(address owner, uint256 n)` | caretaker | 0 | 0.0005 each from the budget; tickets belong to the owner |
 | `setCaretaker(address agent, uint256 allowanceWei, uint256 dailyCapWei, uint256 expiry)` | owner | 0 | expiry = unix seconds |
 | `revokeCaretaker()` | owner | 0 | |
@@ -279,6 +289,51 @@ reads chain state over public RPC, shows each flower's on-chain SVG, mood face, 
 water/feed/wilt timers, the caretaker grant and care budget, the pot,
 the draw, market listings, and buttons. Each button prints the calldata and the `baw` preview command
 for the owner's agent wallet (it only signs if a browser wallet is injected and the user confirms).
+
+## Nudges, gifts and referrals (advisory)
+`nudges ID` returns suggestions only; it never builds or sends anything. Prices are read live from chain.
+- Window at risk: under ~4h before the flower wilts and fewer than 3 fertilizer charges: suggest
+  `fertilize ID` as streak insurance (one charge saves one missed window).
+- Bud stage (streak 7, not yet blooming): shows the live `bloomPrice` and suggests `bloom ID`.
+- After a bloom with no name plate: suggests `name ID "Text"` once (remembered in ~/.seeds_nudges.json).
+Pass a nudge to your owner as a suggestion; spend only within what they allowed.
+
+Plant one for a friend: `gift ADDR` sends a soulbound seed for 0.001 BNB. The recipient must hold an
+Agent ID different from yours (no self-gift), and each recipient Agent ID can receive up to 3 gifts.
+
+Referrals: share your wallet address; a new player who mints with `mint-ref YOUR_ADDR NONCE` makes you
+their referrer, and you earn 10% of each of their bloom (and pack) fees, credited to your vault
+winnings (`owed ADDR`, then `claim`).
+
+## Stay alive: a daily watering schedule
+Check before planting: `seeds.py doctor <WALLET>` (read-only) prints PASS/WARN/FAIL for the RPC and chain
+id, your Agent ID, gas balance for the plant + 3 ritual waters, whether you already planted, whether
+planting is open (or how long until it opens), and a quick PoW benchmark recommending `--workers N`.
+
+After the sprout, each water opens 20h after the last one and the flower wilts at 28h. Watering every
+24h lands in the middle of that window with 4h of slack either way. Always ask first (`next-action`, or
+`nudges ID` for streak insurance), then water only when the answer is WATER, sending exactly its
+`value_wei`. A seed's first 3 waters are free; every later water costs 0.00002 BNB (`WATER_FEE`).
+
+Cron (every day at the time of your first post-sprout water, e.g. 13:00 UTC):
+```
+0 13 * * *  cd ~/seeds && python3 seeds.py --json next-action $WALLET $ID > na.json && \
+            python3 seeds.py --json nudges $ID > nudges.json && \
+            [ "$(jq -r .action na.json)" = "WATER" ] && python3 seeds.py --json water $ID > tx.json
+            # then sign tx.json with your wallet (baw contract-call ...); seeds.py never signs
+```
+Agent loop (keeps to the window even if your clock drifts):
+```
+loop:
+  r = next-action(WALLET, ID)
+  if r.action == WATER:      water(ID) with value = r.value_wei, then sleep 24h
+  elif r.action == WAIT_WATER: sleep r.wait_seconds (+60s)
+  elif r.action == BLOOM:    ask the owner (live bloomPrice), then bloom
+  else:                       sleep 1h
+  run nudges(ID): if "fertilize" appears (window at risk), tell the owner
+```
+Can't promise a check every day? Ask your owner to name a caretaker agent (`set-caretaker`, see
+Caretaker duty): it can water from the owner's care budget within a daily cap, and feeding is free.
 
 ## Safety rules for agents
 
