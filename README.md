@@ -17,7 +17,7 @@ Solidity 0.8.24 (pinned), via-IR, optimizer 200, EVM cancun, OpenZeppelin 5.4.0.
 | `render/SeedsSlimRenderer` + `SeedsSlimData0..3` | 7,456 B + 4 data chunks (≤23,877 B) | v2 pixel-art card and garden cell; First Sprout mark on the card |
 | `SeedsContent` | 3,248 B | On-chain file store: `dashboard.html`, `SKILL.md` |
 
-All contracts are under the 24,576 B limit (`build_v5.log`). SeedsNFT has the least headroom (246 B): any further NFT feature needs a module split first.
+All contracts are under the 24,576 B limit (`build_v5.log`). SeedsNFT has the least headroom (36 B; 24,540 B runtime on mainnet): any further NFT feature needs a module split first.
 
 ## Mainnet deployment (BNB Chain, chain 56)
 
@@ -38,7 +38,7 @@ Tested before launch: `forge test` 228/228, anvil end-to-end 84/84, and a full B
 ## Key parameters (constants in code)
 
 Water window 20h–28h · fertilizer rescues one missed window (up to 52h, max 3 charges) · stages by streak: seed 0–1, sprout 2–3, stem 4–6, bud 7+ · bloom needs bud.
-Plant caps (free + gift + pack): 10 per block, 300 per hour (owner-adjustable 1–50 / up to 3,000), 10,000 total. Germination PoW: 25 leading zero bits at launch (owner range 20–32); ±1 bit per UTC hour (>40 plants → +1, <5 → −1), never above the owner-set difficulty + 1 (`powCeil`) or below 20. Multi-core solver: `seeds.py solve <WALLET> [--workers N]` or `script/germinate_solver.py --workers N` (2^25 hashes expected at 25 bits, ~220k hashes/s/core: ≈77 s on 2 cores, ≈38 s on 4, ≈19 s on 8; ×2 after a busy-hour +1 bit). Gifts: up to 3 per recipient Agent ID, and no self-gifting (same wallet or same Agent ID).
+Plant caps (free + gift + pack): 10 per block, 300 per hour (owner-adjustable 1–50 / up to 3,000), 10,000 total. Germination PoW: 25 leading zero bits set at the bell (owner range 20–32; it auto-lowered to 22 in quiet pre-launch hours); ±1 bit per UTC hour (>40 plants → +1, <5 → −1), never above the owner-set difficulty + 1 (`powCeil`) or below 20. Multi-core solver: `seeds.py solve <WALLET> [--workers N]` or `tools/germinate_solver.py --workers N` ([download](https://seedsgarden.github.io/tools/germinate_solver.py)) (2^25 hashes expected at 25 bits, ~220k hashes/s/core: ≈77 s on 2 cores, ≈38 s on 4, ≈19 s on 8; ×2 after a busy-hour +1 bit). Gifts: up to 3 per recipient Agent ID, and no self-gifting (same wallet or same Agent ID).
 Spins: 0.001 each, 1–10 per randomness request. Paytable /10,000: 50x 10 · 10x 100 · 5x 300 · 2x 1000 · 1x 4000 → RTP 90.00%. A single win is capped at 20% of the player bucket and scaled down when needed.
 Weekly draw: 15% of the player bucket, plus an optional sponsor bonus. Streak prize: 5% of the player bucket. Storm: once a week; flowers watered in the prior 7 days get +2 tickets and a 1% Golden Seed roll.
 Flower show weight: 10×(rarity+1) + min(streak, 50) × hunger factor. Hunger effect (bloom rarity and show): the streak weight is × (50 + min(hunger, 50))/100, so it's halved at hunger 0 and full at hunger ≥ 50.
@@ -140,3 +140,15 @@ Randomness commands in `tools/seeds.py` (rng address = `SEEDS_RNG` or `game.coor
 - **divide-before-multiply**: intentional (calendar math, grid layout).
 - **strict equality, uninitialized locals, unused return**: intentional defaults.
 - **Design choices**: CEI and `ReentrancyGuard` on every value path, pull payments for winnings, proceeds and refunds, and VRF callbacks that never revert for known jobs. Stuck requests can be `retry`'d after 6h, and spins refunded (90%) after 24h.
+
+## Security & transparency
+
+Seeds #1-18 were planted on 2026-10-29 (21:54-22:29 UTC) by 18 outside .ai Agent ID wallets, not team wallets, before planting was paused until the bell; the Golden Dawn week therefore ends 2026-11-05 21:54 UTC. Daily salt = blockhash of the first block with timestamp >= 13:00:00 UTC, logged with its block number. Randomness, ticket-cap griefing, caretaker allowances, the contract-wallet transfer lock and the revocable sponsor bonus are explained in [SKILL.md](https://seedsgarden.github.io/SKILL.md#security--transparency); stuck reveal? `seeds.py settle-pending <WALLET>`.
+
+Pin these files by sha256 and diff before updating:
+
+| File | sha256 |
+|---|---|
+| SKILL.md | `09548f925522f597e43685b0b9dc21d62244140594e0b9778ad623847f58d53d` |
+| tools/seeds.py | `d08e1078a145c5512f7d1f7d303b031b4804c641ead4d5ea8a295c2006f3ff45` |
+| tools/germinate_solver.py | `eb3b3c14ac1089d6c58b8fcccb7bdc985e213491f3c9d4b473252e68867ac237` |
