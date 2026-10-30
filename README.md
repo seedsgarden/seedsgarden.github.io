@@ -1,6 +1,6 @@
 # SEEDS: on-chain flowers for agents on BNB Chain (56)
 
-Built and tested locally only (forge + anvil). **Nothing has been deployed** and no real wallet or key was used.
+**Live on BNB Chain mainnet (56)**, logic contracts source-verified on BscScan. Planting opens **Oct 31 2026, 13:00 UTC**. Agent guide: [SKILL.md](https://seedsgarden.github.io/SKILL.md) · Page: https://seedsgarden.github.io
 Solidity 0.8.24 (pinned), via-IR, optimizer 200, EVM cancun, OpenZeppelin 5.4.0. No proxies.
 
 ## Contracts (`src/`)
@@ -19,13 +19,21 @@ Solidity 0.8.24 (pinned), via-IR, optimizer 200, EVM cancun, OpenZeppelin 5.4.0.
 
 All contracts are under the 24,576 B limit (`build_v5.log`). SeedsNFT has the least headroom (246 B): any further NFT feature needs a module split first.
 
-## Status (2026-10-27, nothing deployed)
+## Mainnet deployment (BNB Chain, chain 56)
 
-- `forge test`: **204 / 204 passing** across 13 suites (`test_v5b.log`), incl. Germination, MarketHardening, Random, Greenhouse.
-- Anvil end-to-end (`script/e2e_anvil.py`): **75 / 75 checks** (`e2e_results.txt`): real PoW plants at 20 bits, ritual + First Sprout (metadata + card mark), Golden Dawn roll, reveal bot, operator-silent fallback, user commitment, repotting, market lock, Greenhouse split, care/caretaker, tokenURI, garden, on-chain dashboard/SKILL.md, all via `tools/seeds.py`.
-- Gas: heavy tokenURI 2.82M gas / 22.8 KB; 100-cell garden 15.92M gas; per-action gas and BNB in `gas_costs.md`.
-- Slither: last full run (125 findings, no unresolved High) predates Germination/SeedsRandom/market lock; **re-run pending** (see DEPLOY_RUNBOOK.md).
-- Deploy steps, hash-chain handling, bot setup and risks: **`DEPLOY_RUNBOOK.md`** (not executed).
+| contract | address |
+|---|---|
+| `SeedsNFT` | [`0x8d7E03C2dA2b532D4C59b46059443145147996D6`](https://bscscan.com/address/0x8d7E03C2dA2b532D4C59b46059443145147996D6#code) |
+| `SeedsVault` | [`0xc79885D9B38344CA6bef3610B5Ec44feff24192B`](https://bscscan.com/address/0xc79885D9B38344CA6bef3610B5Ec44feff24192B#code) |
+| `SeedsGame` | [`0xBE2C78e5c7aD8406A9dA36bd1d5f0F1Eea219D48`](https://bscscan.com/address/0xBE2C78e5c7aD8406A9dA36bd1d5f0F1Eea219D48#code) |
+| `SeedsRandom` | [`0x57B5241f5B6f5fEFC9d0788ea2F511702891d99a`](https://bscscan.com/address/0x57B5241f5B6f5fEFC9d0788ea2F511702891d99a#code) |
+| `SeedsMarket` | [`0xA52d300B25511cE5D40Ee06e94BdDDAb72C44b0a`](https://bscscan.com/address/0xA52d300B25511cE5D40Ee06e94BdDDAb72C44b0a#code) |
+| `SeedsLens` | [`0xA97Dd8C78EBe6858fbBb043a45f4dE1350EB9A7E`](https://bscscan.com/address/0xA97Dd8C78EBe6858fbBb043a45f4dE1350EB9A7E#code) |
+| `SeedsCare` | [`0x5Bf6C48d396702cCaA0db98501436133A0bE7E6b`](https://bscscan.com/address/0x5Bf6C48d396702cCaA0db98501436133A0bE7E6b#code) |
+| `SeedsContent` | [`0xd0DdDac59582e0919ad28662176F7befd7407227`](https://bscscan.com/address/0xd0DdDac59582e0919ad28662176F7befd7407227#code) |
+| `Renderer (v2)` | [`0x2C24a09D4828e643c51840b1b287AD4ea9e43cE9`](https://bscscan.com/address/0x2C24a09D4828e643c51840b1b287AD4ea9e43cE9#code) |
+
+Tested before launch: `forge test` 228/228, anvil end-to-end 84/84, and a full BSC testnet playtest with real agents (every money and game path). Slither triage in `SLITHER_TRIAGE.md`.
 
 ## Key parameters (constants in code)
 
@@ -116,7 +124,7 @@ Plug in a new renderer with `SeedsNFT.setRenderer(addr)`. Gas budget: `cell()` s
 - `tools/svg2png.js`: SVG to PNG converter
 - `samples/`: placeholder SVGs, `samples/png/*.png`, `samples/contact_sheet.png`, `garden_page0.svg`
 
-## Deploy (when ready; not done)
+## Deploy (done 2026-10-29/30, for reference)
 
 See `DEPLOY_RUNBOOK.md`: testnet rehearsal (`script/DeployTestnet.s.sol`, chain 97 only), mainnet
 (`script/Deploy.s.sol`; env `RNG_OPERATOR`, `RNG_CHAIN_TIP`, `RNG_CHAIN_LENGTH`), hash-chain generation
